@@ -1,0 +1,1 @@
+Mã nguồn khung do ChatGPT tạo ra phục vụ người dùng tổ chức nghiên cứu. Trọng số mô hình ngoài, thư viện Python, dữ liệu hành chính và văn bản nguồn tuân theo điều khoản/cấp phép riêng của từng nguồn. Không có dữ liệu hành chính thật trong bộ kit.

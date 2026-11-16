@@ -1,0 +1,7 @@
+{
+  "policy_version": "DU_LIEU_GIA_DINH_CHI_DE_THU_CODE",
+  "units": [
+    {"unit_id": "PHONG_A", "unit_name": "Phòng A giả định", "description": "Phụ trách một số nghiệp vụ văn hóa, giáo dục giả định", "keywords": ["giáo dục", "văn hóa"], "valid_from": "2026-01-01", "valid_to": null, "authority_source": "GIẢ ĐỊNH", "deny_keywords": []},
+    {"unit_id": "PHONG_B", "unit_name": "Phòng B giả định", "description": "Phụ trách một số nghiệp vụ kinh tế, thương mại giả định", "keywords": ["kinh tế", "thương mại"], "valid_from": "2026-01-01", "valid_to": null, "authority_source": "GIẢ ĐỊNH", "deny_keywords": []}
+  ]
+}
