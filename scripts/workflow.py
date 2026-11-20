@@ -6,8 +6,11 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import platform
+import random
 import re
+import shutil
 import subprocess
 import sys
 import unicodedata
@@ -26,6 +29,41 @@ MANIFEST = ["document_id", "filename", "file_sha256", "family_id", "doc_date", "
 E5 = ["gold_task_id", "pred_task_id", "document_id", "task_correct", "actor_correct", "deadline_correct", "unit_correct", "error_type", "reviewer", "notes"]
 DRAFT = ["document_id", "segment_id", "source_location", "segment_text"]
 TASK_PRED = ["task_id", "document_id", "task_text", "source_actor", "deadline_iso", "deliverable"]
+PILOT_AUDIT = DRAFT + ["pilot_order", "selection_stratum", "heuristic_task_signal", "length_bucket", "is_duplicate_text", "is_table_like"]
+AI_SUGGESTIONS = DRAFT + [
+    "suggested_task_present", "suggested_commune_relevance",
+    "task_confidence", "commune_confidence",
+    "matched_task_terms", "matched_commune_terms",
+    "suggestion_method", "human_review_required", "research_status",
+]
+
+
+def configure_utf8_console():
+    """Ưu tiên UTF-8 khi PowerShell đang trả về bảng mã cp1252."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            try:
+                stream.reconfigure(encoding='utf-8', errors='replace')
+            except (OSError, ValueError):
+                pass
+
+
+def configure_tesseract():
+    """Tìm Tesseract tại vị trí Windows thông dụng mà không sửa PATH hệ thống."""
+    import pytesseract
+    if shutil.which('tesseract'):
+        return
+    if os.name != 'nt':
+        return
+    candidates = [
+        Path(os.environ.get('ProgramFiles', r'C:\Program Files')) / 'Tesseract-OCR' / 'tesseract.exe',
+        Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')) / 'Tesseract-OCR' / 'tesseract.exe',
+        Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'Tesseract-OCR' / 'tesseract.exe',
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            pytesseract.pytesseract.tesseract_cmd = str(candidate)
+            return
 
 
 def project(p):
@@ -41,11 +79,55 @@ def dump_csv(p, rows, headers):
         w.writerows(rows)
 
 
+def replace_csvs_atomically(specs):
+    """Ghi nhiều CSV qua file tạm; khôi phục bản cũ nếu một lần thay thế bị lỗi."""
+    token = f'{os.getpid()}_{datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")}'
+    staged = []
+    backups = []
+    replaced = []
+    try:
+        for path, rows, headers in specs:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_name(f'.{path.name}.{token}.tmp')
+            dump_csv(temp, rows, headers)
+            staged.append((path, temp))
+        for path, _ in staged:
+            backup = path.with_name(f'.{path.name}.{token}.bak')
+            if path.exists():
+                shutil.copy2(path, backup)
+                backups.append((path, backup, True))
+            else:
+                backups.append((path, backup, False))
+        for path, temp in staged:
+            os.replace(temp, path)
+            replaced.append(path)
+    except Exception:
+        for path, backup, existed in reversed(backups):
+            if backup.exists():
+                os.replace(backup, path)
+            elif not existed and path in replaced and path.exists():
+                path.unlink()
+        raise
+    finally:
+        for _, temp in staged:
+            if temp.exists():
+                temp.unlink()
+        for _, backup, _ in backups:
+            if backup.exists():
+                backup.unlink()
+
+
 def read_csv(p):
     p = project(p) if isinstance(p, str) else p
     if not p.exists():
         raise SystemExit(f'CHƯA CÓ FILE: {p}')
     return pd.read_csv(p, dtype=str, keep_default_na=False)
+
+
+def require_columns(df, columns, name):
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        raise SystemExit(f'{name}: thiếu cột {", ".join(missing)}')
 
 
 def no_overwrite(p, force=False):
@@ -78,6 +160,35 @@ def normalized(s):
     return s.replace('đ', 'd')
 
 
+def normalized_relative_path(value):
+    """Chuẩn hóa đường dẫn tương đối để so sánh an toàn trên Windows."""
+    return str(value).replace('/', '\\').casefold()
+
+
+def unique_document_id(path, file_hash, used_ids):
+    """Sinh mã mới mà không bao giờ thay đổi mã đã tồn tại."""
+    stem = slug(path.stem)
+    for width in (8, 12, 16, 24, 64):
+        candidate = f'{stem}_{file_hash[:width]}'
+        if candidate not in used_ids:
+            return candidate
+    suffix = 2
+    while f'{stem}_{file_hash}_{suffix}' in used_ids:
+        suffix += 1
+    return f'{stem}_{file_hash}_{suffix}'
+
+
+def write_incremental_log(payload):
+    evidence = project('evidence')
+    evidence.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
+    path = evidence / f'ingest_incremental_{stamp}.json'
+    temp = evidence / f'.{path.name}.tmp'
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    os.replace(temp, path)
+    return path
+
+
 def init(args):
     for folder in ['data/raw', 'data/processed', 'data/annotations', 'data/splits', 'config', 'results/predictions', 'results/metrics', 'results/errors', 'evidence', 'paper']:
         project(folder).mkdir(parents=True, exist_ok=True)
@@ -98,6 +209,7 @@ def ocr_page(page):
     import pytesseract
     from PIL import Image
     from io import BytesIO
+    configure_tesseract()
     pix = page.get_pixmap(matrix=__import__('fitz').Matrix(2, 2), alpha=False)
     im = Image.open(BytesIO(pix.tobytes('png')))
     return pytesseract.image_to_string(im, lang='vie+eng', config='--psm 3')
@@ -148,8 +260,218 @@ def segments_of_file(path, do_ocr=False):
             return []
         import pytesseract
         from PIL import Image
+        configure_tesseract()
         return [('image:1/OCR', stripped(pytesseract.image_to_string(Image.open(path), lang='vie+eng')))]
     return []
+
+
+def ingest_incremental(args, docs, manfile, segfile):
+    """Chỉ nối thêm tài liệu mới; không sửa hàng cũ hoặc nhãn đã có."""
+    if getattr(args, 'force', False):
+        raise SystemExit('Không kết hợp --incremental với --force. Incremental không ghi đè dữ liệu cũ.')
+
+    manifest = read_csv(manfile)
+    segments = read_csv(segfile)
+    require_columns(manifest, MANIFEST, 'documents_manifest.csv')
+    require_columns(segments, DRAFT, 'candidate_segments.csv')
+    if manifest.document_id.duplicated().any():
+        raise SystemExit('Manifest có document_id trùng; phải xử lý trước khi ingest incremental.')
+    if segments.segment_id.duplicated().any():
+        raise SystemExit('candidate_segments có segment_id trùng; phải xử lý trước khi ingest incremental.')
+    if not segments.empty and not segments.document_id.isin(manifest.document_id).all():
+        raise SystemExit('candidate_segments có document_id không tồn tại trong manifest; dừng để tránh làm hỏng dữ liệu.')
+
+    manifest_rows = manifest.to_dict('records')
+    segment_rows = segments.to_dict('records')
+    manifest_headers = list(manifest.columns)
+    segment_headers = list(segments.columns)
+    used_ids = set(manifest.document_id)
+    used_segment_ids = set(segments.segment_id)
+    known_hashes = defaultdict(list)
+    known_paths = {}
+    for record in manifest_rows:
+        known_hashes[record['file_sha256'].lower()].append(record)
+        known_paths[normalized_relative_path(record['filename'])] = record
+
+    raw_relative_paths = {
+        normalized_relative_path(str(path.relative_to(ROOT))): path for path in docs
+    }
+    missing_manifest_files = [
+        record['filename'] for record in manifest_rows
+        if normalized_relative_path(record['filename']) not in raw_relative_paths
+    ]
+    log = dict(
+        utc=datetime.now(timezone.utc).isoformat(),
+        mode='incremental',
+        ocr=bool(args.ocr),
+        manifest_rows_before=len(manifest_rows),
+        segment_rows_before=len(segment_rows),
+        scanned_files=len(docs),
+        new_documents=[],
+        skipped_duplicates=[],
+        modified_documents=[],
+        missing_manifest_files=missing_manifest_files,
+        errors=[],
+        annotations_appended=0,
+    )
+
+    new_manifest_rows = []
+    new_segment_rows = []
+    for path in docs:
+        relative = str(path.relative_to(ROOT))
+        relative_key = normalized_relative_path(relative)
+        try:
+            file_hash = sha256(path).lower()
+        except Exception as exc:
+            log['errors'].append(dict(filename=relative, stage='sha256', error=str(exc)))
+            print(f'LỖI đọc/hash {relative}: {exc}', file=sys.stderr)
+            continue
+
+        if relative_key in known_paths:
+            old = known_paths[relative_key]
+            if file_hash == old['file_sha256'].lower():
+                log['skipped_duplicates'].append(dict(
+                    filename=relative,
+                    file_sha256=file_hash,
+                    reason='same_path_and_hash',
+                    existing_filenames=[old['filename']],
+                ))
+                continue
+            warning = dict(
+                filename=relative,
+                document_id=old['document_id'],
+                recorded_sha256=old['file_sha256'],
+                current_sha256=file_hash,
+                action='skipped_requires_separate_review',
+            )
+            log['modified_documents'].append(warning)
+            print(
+                f'CẢNH BÁO: file cũ đã đổi nội dung: {relative}; '
+                'không nhập và không ghi đè. Hãy xử lý phiên bản riêng.',
+                file=sys.stderr,
+            )
+            continue
+
+        if file_hash in known_hashes:
+            originals = [record['filename'] for record in known_hashes[file_hash]]
+            log['skipped_duplicates'].append(dict(
+                filename=relative,
+                file_sha256=file_hash,
+                reason='same_hash_different_name',
+                existing_filenames=originals,
+            ))
+            print(f'BỎ QUA bản đổi tên/trùng nội dung: {relative} (SHA256 đã có).')
+            continue
+
+        try:
+            items = segments_of_file(path, args.ocr)
+            if not items:
+                raise ValueError('Không trích xuất được đoạn; nếu là ảnh/scan hãy chạy lại với --ocr.')
+            document_id = unique_document_id(path, file_hash, used_ids)
+            candidate_rows = []
+            for index, (location, text_value) in enumerate(items, 1):
+                segment_id = f'{document_id}_S{index:04d}'
+                if segment_id in used_segment_ids:
+                    raise ValueError(f'Segment ID xung đột: {segment_id}')
+                candidate_rows.append(dict(
+                    document_id=document_id,
+                    segment_id=segment_id,
+                    source_location=location,
+                    segment_text=text_value,
+                ))
+            manifest_record = dict(
+                document_id=document_id,
+                filename=relative,
+                file_sha256=file_hash,
+                family_id='',
+                doc_date='',
+                doc_type=path.suffix.lower().lstrip('.'),
+                source_url_or_archive='',
+                permission_basis='',
+                access_level='',
+                anonymized='',
+                notes='CẦN ĐIỀN METADATA; THÊM BẰNG INGEST INCREMENTAL',
+            )
+            new_manifest_rows.append(manifest_record)
+            new_segment_rows.extend(candidate_rows)
+            used_ids.add(document_id)
+            used_segment_ids.update(row['segment_id'] for row in candidate_rows)
+            known_hashes[file_hash].append(manifest_record)
+            known_paths[relative_key] = manifest_record
+            log['new_documents'].append(dict(
+                filename=relative,
+                document_id=document_id,
+                file_sha256=file_hash,
+                segment_count=len(candidate_rows),
+            ))
+            print(f'Đọc mới {path.name}: {len(candidate_rows)} đoạn')
+        except Exception as exc:
+            log['errors'].append(dict(filename=relative, stage='extract', error=str(exc)))
+            print(f'LỖI xử lý {relative}: {exc}', file=sys.stderr)
+
+    annotation_spec = None
+    annotations_path = project('data/annotations/segments_gold.csv')
+    if new_segment_rows and annotations_path.exists():
+        annotations = read_csv(annotations_path)
+        require_columns(annotations, SEGMENTS, 'segments_gold.csv')
+        if annotations.segment_id.duplicated().any():
+            raise SystemExit('segments_gold.csv có segment_id trùng; không thể bổ sung an toàn.')
+        if not annotations.empty:
+            annotation_ids = set(annotations.segment_id)
+            additions = []
+            for row in new_segment_rows:
+                if row['segment_id'] in annotation_ids:
+                    continue
+                additions.append(dict(
+                    document_id=row['document_id'],
+                    segment_id=row['segment_id'],
+                    source_location=row['source_location'],
+                    segment_text=row['segment_text'],
+                    task_present='',
+                    commune_relevance='',
+                    annotator_id='',
+                    label_status='',
+                    notes='',
+                ))
+            if additions:
+                annotation_rows = annotations.to_dict('records') + additions
+                annotation_spec = (annotations_path, annotation_rows, list(annotations.columns))
+                log['annotations_appended'] = len(additions)
+
+    if new_manifest_rows:
+        specs = [
+            (manfile, manifest_rows + new_manifest_rows, manifest_headers),
+            (segfile, segment_rows + new_segment_rows, segment_headers),
+        ]
+        if annotation_spec:
+            specs.append(annotation_spec)
+        try:
+            replace_csvs_atomically(specs)
+        except Exception as exc:
+            log['errors'].append(dict(filename='', stage='commit', error=str(exc)))
+            log['committed'] = False
+            log_path = write_incremental_log(log)
+            raise SystemExit(f'Không thể ghi cập nhật; dữ liệu cũ đã được khôi phục. Log: {log_path}; lỗi: {exc}')
+        log['committed'] = True
+    else:
+        log['committed'] = False
+
+    log['new_document_count'] = len(new_manifest_rows)
+    log['skipped_duplicate_count'] = len(log['skipped_duplicates'])
+    log['modified_document_count'] = len(log['modified_documents'])
+    log['error_count'] = len(log['errors'])
+    log['segments_appended'] = len(new_segment_rows)
+    log['manifest_rows_after'] = len(manifest_rows) + len(new_manifest_rows)
+    log['segment_rows_after'] = len(segment_rows) + len(new_segment_rows)
+    log_path = write_incremental_log(log)
+    skipped_total = log['skipped_duplicate_count'] + log['modified_document_count']
+    print(
+        f'Incremental: mới={log["new_document_count"]}, bỏ qua={skipped_total} '
+        f'(trùng={log["skipped_duplicate_count"]}, đã sửa={log["modified_document_count"]}), '
+        f'đoạn bổ sung={log["segments_appended"]}, lỗi={log["error_count"]}, '
+        f'nhãn trống bổ sung={log["annotations_appended"]}.'
+    )
+    print(f'Nhật ký: {log_path}')
 
 
 def ingest(args):
@@ -159,6 +481,8 @@ def ingest(args):
         raise SystemExit('CHƯA CÓ FILE. Sao chép văn bản được phép nghiên cứu vào data/raw/')
     manfile = project('data/processed/documents_manifest.csv')
     segfile = project('data/processed/candidate_segments.csv')
+    if getattr(args, 'incremental', False):
+        return ingest_incremental(args, docs, manfile, segfile)
     if not args.force and ((manfile.exists() and len(read_csv(manfile)) > 0) or (segfile.exists() and len(read_csv(segfile)) > 0)):
         raise SystemExit('Đã có manifest/candidate_segments. Sao lưu và dùng --force nếu thực sự muốn ghi đè.')
     mans, segs = [], []
@@ -223,6 +547,133 @@ def validate(args):
     print('Đạt các kiểm tra kỹ thuật cơ bản (không thay thế kiểm tra chất lượng gán nhãn).')
 
 
+def quality_report(args):
+    """Xuất thống kê QC dẫn xuất; không sửa manifest, đoạn ứng viên hoặc tài liệu gốc."""
+    manifest = read_csv('data/processed/documents_manifest.csv')
+    segments = read_csv('data/processed/candidate_segments.csv')
+    require_columns(manifest, MANIFEST, 'documents_manifest.csv')
+    require_columns(segments, DRAFT, 'candidate_segments.csv')
+
+    out_dir = project(args.output_dir)
+    summary_path = out_dir / 'dataset_quality_summary.csv'
+    document_path = out_dir / 'document_quality.csv'
+    page_path = out_dir / 'page_quality.csv'
+    for path in (summary_path, document_path, page_path):
+        no_overwrite(path, args.force)
+
+    duplicate_mask = segments.duplicated('segment_text', keep=False)
+    duplicate_groups = segments.loc[duplicate_mask, 'segment_text'].nunique()
+    document_ids = set(manifest.document_id)
+    segment_document_ids = set(segments.document_id)
+    summary = []
+
+    def metric(name, value, note=''):
+        summary.append(dict(metric=name, value=value, note=note))
+
+    metric('manifest_documents', len(manifest))
+    metric('candidate_segments', len(segments))
+    metric('unique_document_id_manifest', manifest.document_id.nunique())
+    metric('unique_document_id_segments', segments.document_id.nunique())
+    metric('unique_segment_id', segments.segment_id.nunique())
+    metric('duplicate_segment_id_rows', int(segments.segment_id.duplicated(keep=False).sum()))
+    metric('blank_segment_text', int(segments.segment_text.str.strip().eq('').sum()))
+    metric('segments_text_length_lt_20', int(segments.segment_text.str.len().lt(20).sum()))
+    metric('segments_text_length_lt_30', int(segments.segment_text.str.len().lt(30).sum()))
+    metric('segments_text_length_ge_1000', int(segments.segment_text.str.len().ge(1000).sum()))
+    metric('duplicate_text_groups', int(duplicate_groups), 'Trùng chính xác; không tự động coi là lỗi.')
+    metric('rows_in_duplicate_text_groups', int(duplicate_mask.sum()))
+    metric('ocr_source_rows', int(segments.source_location.str.endswith('/OCR').sum()))
+    metric('manifest_without_segments', len(document_ids - segment_document_ids))
+    metric('segments_document_not_in_manifest', len(segment_document_ids - document_ids))
+    for column in ['family_id', 'doc_date', 'source_url_or_archive', 'permission_basis', 'access_level', 'anonymized']:
+        metric(f'manifest_blank_{column}', int(manifest[column].str.strip().eq('').sum()))
+
+    document_rows = []
+    page_rows = []
+    raw_status_counts = defaultdict(int)
+    root_resolved = ROOT.resolve()
+    for record in manifest.to_dict('records'):
+        doc_id = record['document_id']
+        doc_segments = segments[segments.document_id.eq(doc_id)]
+        page_numbers = []
+        for location in doc_segments.source_location:
+            match = re.match(r'^page:(\d+)(?:/|$)', location)
+            if match:
+                page_numbers.append(int(match.group(1)))
+        page_counts = pd.Series(page_numbers, dtype='int64').value_counts().to_dict()
+
+        raw_status = 'missing'
+        raw_pages = ''
+        pages_without_segments = []
+        low_native_text_pages = []
+        raw_path = (ROOT / record['filename']).resolve()
+        try:
+            raw_path.relative_to(root_resolved)
+            inside_root = True
+        except ValueError:
+            inside_root = False
+        if not inside_root:
+            raw_status = 'outside_project_root'
+        elif raw_path.is_file():
+            current_hash = sha256(raw_path)
+            raw_status = 'ok' if current_hash.lower() == record['file_sha256'].lower() else 'hash_mismatch'
+            if raw_path.suffix.lower() == '.pdf':
+                import pymupdf
+                with pymupdf.open(raw_path) as pdf:
+                    raw_pages = pdf.page_count
+                    for page_number, page in enumerate(pdf, 1):
+                        native_chars = len(stripped(page.get_text()))
+                        extracted_count = int(page_counts.get(page_number, 0))
+                        if extracted_count == 0:
+                            pages_without_segments.append(page_number)
+                        if native_chars < 30:
+                            low_native_text_pages.append(page_number)
+                        if extracted_count == 0 and native_chars < 30:
+                            status = 'no_segments_low_native_text'
+                        elif extracted_count == 0:
+                            status = 'no_segments_has_native_text'
+                        elif native_chars < 30:
+                            status = 'segments_low_native_text'
+                        else:
+                            status = 'ok'
+                        page_rows.append(dict(
+                            document_id=doc_id,
+                            page_number=page_number,
+                            native_text_chars=native_chars,
+                            extracted_segment_count=extracted_count,
+                            status=status,
+                        ))
+        raw_status_counts[raw_status] += 1
+        document_rows.append(dict(
+            document_id=doc_id,
+            filename=record['filename'],
+            raw_status=raw_status,
+            raw_page_count=raw_pages,
+            extracted_segments=len(doc_segments),
+            unique_segment_id=doc_segments.segment_id.nunique(),
+            pages_with_segments=len(set(page_numbers)),
+            pages_without_segments=';'.join(map(str, pages_without_segments)),
+            low_native_text_pages=';'.join(map(str, low_native_text_pages)),
+            short_segments_lt_20=int(doc_segments.segment_text.str.len().lt(20).sum()),
+            duplicate_text_rows=int(doc_segments.duplicated('segment_text', keep=False).sum()),
+        ))
+
+    for status, count in sorted(raw_status_counts.items()):
+        metric(f'raw_status_{status}', count)
+
+    dump_csv(summary_path, summary, ['metric', 'value', 'note'])
+    dump_csv(document_path, document_rows, list(document_rows[0].keys()) if document_rows else [
+        'document_id', 'filename', 'raw_status', 'raw_page_count', 'extracted_segments',
+        'unique_segment_id', 'pages_with_segments', 'pages_without_segments',
+        'low_native_text_pages', 'short_segments_lt_20', 'duplicate_text_rows',
+    ])
+    dump_csv(page_path, page_rows, list(page_rows[0].keys()) if page_rows else [
+        'document_id', 'page_number', 'native_text_chars', 'extracted_segment_count', 'status',
+    ])
+    print(f'Đã xuất QC không phá hủy: {summary_path}, {document_path}, {page_path}')
+    print('Không có nội dung toàn văn nào được ghi vào báo cáo QC.')
+
+
 def split(args):
     m = read_csv('data/processed/documents_manifest.csv')
     if len(m) < 12 or m.family_id.eq('').any():
@@ -251,6 +702,208 @@ def split(args):
 
 TASK_RX = re.compile(r'\b(giao|yeu cau|de nghi|chu tri|phoi hop|to chuc thuc hien|tham muu|trien khai|bao cao|hoan thanh|ra soat|thuc hien|xay dung ke hoach|tong hop)\b')
 COMMUNE_RX = re.compile(r'\b(ubnd cac xa|ubnd cap xa|ubnd xa|ubnd phuong|xa phuong|cap xa|xa va phuong|cac xa|cac phuong)\b')
+
+
+def sampling_features(segments):
+    """Tạo đặc trưng chọn mẫu; các đặc trưng này không phải nhãn gold."""
+    require_columns(segments, DRAFT, 'candidate_segments.csv')
+    featured = segments.copy().reset_index(drop=True)
+    lengths = featured.segment_text.str.len()
+    featured['_length_bucket'] = pd.cut(
+        lengths,
+        bins=[-1, 19, 299, float('inf')],
+        labels=['short_lt20', 'medium_20_299', 'long_ge300'],
+    ).astype(str)
+    featured['_heuristic_task'] = featured.segment_text.map(
+        lambda text: int(bool(TASK_RX.search(normalized(text))))
+    )
+    featured['_duplicate_text'] = featured.duplicated('segment_text', keep=False).astype(int)
+    featured['_table_like'] = featured.segment_text.str.contains('|', regex=False).astype(int)
+    featured['_stratum'] = (
+        'task' + featured['_heuristic_task'].astype(str)
+        + '__' + featured['_length_bucket']
+        + '__dup' + featured['_duplicate_text'].astype(str)
+        + '__table' + featured['_table_like'].astype(str)
+    )
+    return featured
+
+
+def select_pilot_rows(segments, n=80, seed=42, min_per_document=3):
+    """Chọn mẫu đa dạng, xác định được bằng seed và không tạo nhãn nghiên cứu."""
+    if n <= 0:
+        raise SystemExit('--n phải lớn hơn 0')
+    if min_per_document < 0:
+        raise SystemExit('--min-per-document không được âm')
+    if n > len(segments):
+        raise SystemExit(f'Yêu cầu {n} đoạn nhưng chỉ có {len(segments)} đoạn ứng viên.')
+    featured = sampling_features(segments)
+    document_sizes = featured.groupby('document_id').size()
+    if (document_sizes < min_per_document).any():
+        bad = int((document_sizes < min_per_document).sum())
+        raise SystemExit(f'Có {bad} văn bản không đủ {min_per_document} đoạn để bảo đảm mức tối thiểu.')
+    minimum_required = len(document_sizes) * min_per_document
+    if n < minimum_required:
+        raise SystemExit(f'Cần n >= {minimum_required} để chọn ít nhất {min_per_document} đoạn cho mỗi văn bản.')
+
+    rng = random.Random(seed)
+    selected = []
+    remaining = set(featured.index.tolist())
+
+    def diverse_pick(indices, count):
+        by_stratum = defaultdict(list)
+        for index in indices:
+            by_stratum[featured.at[index, '_stratum']].append(index)
+        strata = sorted(by_stratum)
+        rng.shuffle(strata)
+        for values in by_stratum.values():
+            rng.shuffle(values)
+        chosen = []
+        while len(chosen) < count and strata:
+            next_strata = []
+            for stratum in strata:
+                if by_stratum[stratum] and len(chosen) < count:
+                    chosen.append(by_stratum[stratum].pop())
+                if by_stratum[stratum]:
+                    next_strata.append(stratum)
+            strata = next_strata
+        return chosen
+
+    # Mức nền bảo đảm mọi tài liệu đều có mặt, nhưng vẫn đa dạng độ dài/tín hiệu.
+    for document_id in sorted(document_sizes.index):
+        indices = featured.index[featured.document_id.eq(document_id)].tolist()
+        chosen = diverse_pick(indices, min_per_document)
+        selected.extend(chosen)
+        remaining.difference_update(chosen)
+
+    # Phần còn lại ưu tiên cân bằng tín hiệu có/không có từ khóa nhiệm vụ và các tầng ít gặp.
+    desired_positive = n // 2
+    while len(selected) < n:
+        selected_positive = sum(int(featured.at[i, '_heuristic_task']) for i in selected)
+        need_positive = selected_positive < desired_positive
+        preferred = [i for i in remaining if bool(featured.at[i, '_heuristic_task']) == need_positive]
+        pool = preferred or list(remaining)
+        stratum_counts = defaultdict(int)
+        for index in selected:
+            stratum_counts[featured.at[index, '_stratum']] += 1
+        minimum_count = min(stratum_counts[featured.at[i, '_stratum']] for i in pool)
+        least_seen = [i for i in pool if stratum_counts[featured.at[i, '_stratum']] == minimum_count]
+        chosen = rng.choice(sorted(least_seen))
+        selected.append(chosen)
+        remaining.remove(chosen)
+
+    order_rng = random.Random(seed + 1)
+    order_rng.shuffle(selected)
+    pilot = featured.loc[selected].copy().reset_index(drop=True)
+    pilot['pilot_order'] = range(1, len(pilot) + 1)
+    return pilot
+
+
+def sample_pilot(args):
+    segments = read_csv('data/processed/candidate_segments.csv')
+    pilot = select_pilot_rows(segments, args.n, args.seed, args.min_per_document)
+    master_path = project(args.master)
+    annotator_a_path = project(args.annotator_a)
+    annotator_b_path = project(args.annotator_b)
+    summary_path = project(args.summary)
+    for path in (master_path, annotator_a_path, annotator_b_path, summary_path):
+        no_overwrite(path, args.force)
+
+    master_rows = []
+    annotation_rows = []
+    for record in pilot.to_dict('records'):
+        master_rows.append(dict(
+            document_id=record['document_id'],
+            segment_id=record['segment_id'],
+            source_location=record['source_location'],
+            segment_text=record['segment_text'],
+            pilot_order=record['pilot_order'],
+            selection_stratum=record['_stratum'],
+            heuristic_task_signal=record['_heuristic_task'],
+            length_bucket=record['_length_bucket'],
+            is_duplicate_text=record['_duplicate_text'],
+            is_table_like=record['_table_like'],
+        ))
+        annotation_rows.append(dict(
+            document_id=record['document_id'],
+            segment_id=record['segment_id'],
+            source_location=record['source_location'],
+            segment_text=record['segment_text'],
+            task_present='',
+            commune_relevance='',
+            annotator_id='',
+            label_status='',
+            notes='',
+        ))
+
+    summary_rows = [
+        dict(group='overall', value='rows', count=len(pilot)),
+        dict(group='overall', value='documents', count=pilot.document_id.nunique()),
+    ]
+    for column, group_name in [
+        ('document_id', 'document_id'),
+        ('_heuristic_task', 'heuristic_task_signal'),
+        ('_length_bucket', 'length_bucket'),
+        ('_duplicate_text', 'is_duplicate_text'),
+        ('_table_like', 'is_table_like'),
+    ]:
+        for value, count in pilot[column].value_counts(dropna=False).sort_index().items():
+            summary_rows.append(dict(group=group_name, value=value, count=int(count)))
+
+    dump_csv(master_path, master_rows, PILOT_AUDIT)
+    dump_csv(annotator_a_path, annotation_rows, SEGMENTS)
+    dump_csv(annotator_b_path, annotation_rows, SEGMENTS)
+    dump_csv(summary_path, summary_rows, ['group', 'value', 'count'])
+    print(f'Đã chọn {len(pilot)} đoạn từ {pilot.document_id.nunique()} văn bản, seed={args.seed}.')
+    print(f'File kiểm toán chọn mẫu: {master_path}')
+    print(f'Hai biểu gán độc lập, không lộ tín hiệu heuristic: {annotator_a_path}, {annotator_b_path}')
+    print('Mọi cột nhãn đều để trống; kết quả chọn mẫu không phải nhãn gold.')
+
+
+def suggest_pilot_labels(args):
+    """Sinh gợi ý máy cục bộ; tuyệt đối không phải nhãn gold hay người gán độc lập."""
+    source = read_csv(args.input)
+    require_columns(source, DRAFT, args.input)
+    if source.segment_id.duplicated().any():
+        raise SystemExit(f'{args.input}: segment_id bị trùng')
+    output = project(args.output)
+    no_overwrite(output, args.force)
+    rows = []
+    for record in source.to_dict('records'):
+        text_normalized = normalized(record['segment_text'])
+        task_terms = sorted(set(TASK_RX.findall(text_normalized)))
+        commune_terms = sorted(set(COMMUNE_RX.findall(text_normalized)))
+        suggested_task = int(bool(task_terms))
+        suggested_commune = int(bool(suggested_task and commune_terms))
+        text_length = len(stripped(record['segment_text']))
+        task_confidence = 'medium' if len(task_terms) >= 2 else 'low'
+        commune_confidence = 'medium' if suggested_commune and len(commune_terms) >= 1 else 'low'
+        if text_length < 20:
+            task_confidence = 'low'
+            commune_confidence = 'low'
+        rows.append(dict(
+            document_id=record['document_id'],
+            segment_id=record['segment_id'],
+            source_location=record['source_location'],
+            segment_text=record['segment_text'],
+            suggested_task_present=suggested_task,
+            suggested_commune_relevance=suggested_commune,
+            task_confidence=task_confidence,
+            commune_confidence=commune_confidence,
+            matched_task_terms=';'.join(task_terms),
+            matched_commune_terms=';'.join(commune_terms),
+            suggestion_method='local_rule_keywords_v1',
+            human_review_required='1',
+            research_status='NON_GOLD_AI_SUGGESTION',
+        ))
+    dump_csv(output, rows, AI_SUGGESTIONS)
+    counts = pd.DataFrame(rows)
+    print(
+        f'Đã tạo {len(rows)} gợi ý máy: '
+        f'task=1: {int(counts.suggested_task_present.astype(int).sum())}, '
+        f'commune=1: {int(counts.suggested_commune_relevance.astype(int).sum())}.'
+    )
+    print(f'File: {output}')
+    print('CẢNH BÁO: NON_GOLD_AI_SUGGESTION; không dùng để tính Kappa/F1 hoặc thay nhãn con người.')
 
 
 def predict_detection(args):
@@ -474,6 +1127,7 @@ def audit(args):
 
 
 def main():
+    configure_utf8_console()
     parser=argparse.ArgumentParser(description='SF2026 reproducible starter (không có dữ liệu hoặc số liệu minh họa giả mạo)')
     sub=parser.add_subparsers(dest='cmd', required=True)
     def add(name, fn, force=False):
@@ -481,9 +1135,12 @@ def main():
         if force: p.add_argument('--force',action='store_true')
         return p
     add('init',init)
-    p=add('ingest',ingest,True);p.add_argument('--ocr',action='store_true')
+    p=add('ingest',ingest,True);p.add_argument('--ocr',action='store_true');p.add_argument('--incremental',action='store_true')
     add('prepare-annotations',prepare_annotations,True)
     add('validate',validate)
+    p=add('quality-report',quality_report,True);p.add_argument('--output-dir',default='results/quality')
+    p=add('sample-pilot',sample_pilot,True);p.add_argument('--n',type=int,default=80);p.add_argument('--seed',type=int,default=42);p.add_argument('--min-per-document',type=int,default=3);p.add_argument('--master',default='data/annotations/pilot_segments.csv');p.add_argument('--annotator-a',default='data/annotations/segments_annotatorA.csv');p.add_argument('--annotator-b',default='data/annotations/segments_annotatorB.csv');p.add_argument('--summary',default='results/quality/pilot_selection_summary.csv')
+    p=add('suggest-pilot-labels',suggest_pilot_labels,True);p.add_argument('--input',default='data/annotations/pilot_segments.csv');p.add_argument('--output',default='data/annotations/segments_ai_suggestions.csv')
     p=add('qc-labels',qc_labels,True);p.add_argument('--annotator-a',default='data/annotations/segments_annotatorA.csv');p.add_argument('--annotator-b',default='data/annotations/segments_annotatorB.csv')
     p=add('split',split,True);p.add_argument('--seed',type=int,default=42);p.add_argument('--test-size',type=float,default=.15);p.add_argument('--dev-size',type=float,default=.15)
     p=add('predict-detection',predict_detection,True);p.add_argument('--split',choices=['train','dev','test'],default='dev')

@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "datasets": {
+    "ota": {
+      "repo_id": "tedbelford/OTA-dataset",
+      "revision": "42196fc627aa0c3070d843a6868970ad0d72a2cc",
+      "license": "MIT",
+      "role": "external_organization_task_relation_extraction",
+      "research_status": "EXTERNAL_NOT_TARGET_GOLD",
+      "files": [
+        {
+          "path": "README.md",
+          "size": 3617,
+          "sha256": ""
+        },
+        {
+          "path": "OTA-dataset.zip",
+          "size": 205923018,
+          "sha256": "287f66e6022528b02187a0dbc557f7ba6721dd922b25869d080f7570e34900e8"
+        }
+      ]
+    },
+    "pap_ner": {
+      "repo_id": "Leekien0108/PAP_NER",
+      "revision": "7a0f6b1233667702925baa69c07c55d5d26eb6cd",
+      "license": "CC-BY-4.0",
+      "role": "external_token_classification_pretraining_for_e3",
+      "research_status": "EXTERNAL_NOT_TARGET_GOLD",
+      "files": [
+        {
+          "path": "README.md",
+          "size": 6621,
+          "sha256": ""
+        },
+        {
+          "path": "dev_data.txt",
+          "size": 5065759,
+          "sha256": ""
+        },
+        {
+          "path": "test_data.txt",
+          "size": 5031951,
+          "sha256": ""
+        },
+        {
+          "path": "train_data.txt",
+          "size": 64502223,
+          "sha256": "46415fc40e88c3a415a2ee4404bfa39e8a54f8e2cc936a9abb204cb18c323ff1"
+        }
+      ]
+    }
+  }
+}

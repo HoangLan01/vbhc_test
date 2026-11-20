@@ -1,0 +1,7 @@
+Tôi đang tiếp tục dự án nghiên cứu bài báo SF2026 về "Nghiên cứu phương pháp trích xuất và phân luồng nhiệm vụ từ văn bản hành chính tiếng Việt", mã CMT 216. Đây là dự án đã triển khai một phần, KHÔNG bắt đầu lại từ đầu.
+
+Hãy đọc lần lượt AGENTS.md, docs/CODEX_PROJECT_CONTEXT.md, docs/CODEX_CURRENT_STATUS.md, docs/CODEX_NEXT_ACTION.md, README.md, docs/ANNOTATION_GUIDE.md và mã nguồn scripts/workflow.py. Sau đó kiểm tra các file THỰC TẾ trong workspace để xác minh trạng thái hiện tại, đặc biệt data/processed/candidate_segments.csv và documents_manifest.csv.
+
+Tình trạng trao đổi gần nhất: đang dùng Windows 11 + Python 3.11 + .venv + Tesseract (eng/osd/vie); lệnh ingest trước đây đọc 17 PDF, tạo 1.315 đoạn. Một cảnh báo cần kiểm tra OCR ở trang 3 của "5. Nhân lực phụ trách CNTTCĐS.pdf". Chưa có nhãn gold được xác nhận hay kết quả thực nghiệm E1–E5. Mục tiêu hiện tại là kiểm tra chất lượng dữ liệu và chuẩn bị tập gán nhãn pilot 50–100 đoạn, KHÔNG chạy huấn luyện ngay.
+
+LƯỢT ĐẦU CHỈ HÃY RÀ SOÁT, CHƯA CHỈNH SỬA FILE HOẶC CHẠY LỆNH --force. Trả lời bằng tiếng Việt: (1) bạn hiểu công trình và yêu cầu phản biện như thế nào; (2) đã xác minh được gì từ file hiện tại; (3) việc còn thiếu; (4) kế hoạch thao tác ngắn gọn cho bước gán nhãn đầu tiên. Phân biệt rõ dữ liệu thật với giả định.

@@ -33,3 +33,37 @@ Hai người gán cùng danh sách segment, không xem nhãn nhau. Dùng `qc-lab
 
 ## 6. Tách dataset
 Dùng `family_id` bảo đảm tài liệu gần trùng không xuất hiện ở nhiều tập. Khóa tập test và không xem nhãn test khi chỉnh luật/siêu tham số.
+
+## 7. Đơn vị gán nhãn và ngữ cảnh
+
+- Đối tượng gán nhãn là `annotation_unit`, không mặc định đồng nhất với block PDF thô.
+- Một unit có thể ánh xạ một-một tới `segment_id` hoặc là đơn vị dẫn xuất gồm nhiều `member_segment_ids`.
+- Luôn giữ mapping về segment gốc; không đổi hoặc xóa `segment_id`.
+- Ưu tiên đọc unit hiện tại và ngữ cảnh ±3 segment. Dùng toàn văn cùng tài liệu khi chủ thể, tiêu đề mục hoặc phạm vi cấp xã nằm xa hơn.
+- Toàn văn chỉ là căn cứ ngữ cảnh; không gán unit hiện tại là có nhiệm vụ chỉ vì nơi khác trong tài liệu có nhiệm vụ.
+- Nếu text và thứ tự đọc vẫn không đủ tin cậy, đánh dấu `needs_source_check` và mở PDF/ảnh gốc.
+
+Ba tổ hợp nhãn hợp lệ:
+
+- `0/0`: không có nhiệm vụ;
+- `1/0`: có nhiệm vụ nhưng không thuộc trách nhiệm cấp xã;
+- `1/1`: có nhiệm vụ và thuộc trách nhiệm cấp xã.
+
+`0/1` không hợp lệ.
+
+## 8. Segment bị chia vụn
+
+- `needs_merge` chỉ dùng khi nhiều block thực sự nối thành một đơn vị ngữ nghĩa.
+- `member_segment_ids` không phải danh sách các đoạn cung cấp ngữ cảnh; không đưa các đoạn ở xa chỉ vì chúng nêu chủ thể/thời hạn.
+- Các member phải cùng tài liệu, chứa segment hiện tại và không thuộc đồng thời nhiều unit.
+- Header/footer, quốc hiệu, tiêu ngữ và căn cứ vẫn là mẫu âm tính hợp lệ `0/0`, không tự loại khỏi dữ liệu.
+- Ký tự rác hoặc block không thể tạo đơn vị ngữ nghĩa mới dùng `exclude_invalid_unit`.
+- Đơn vị ghép phải được đọc và gán nhãn lại; không tự kế thừa nhãn của một mảnh thành viên.
+
+## 9. Adjudication và phê duyệt pilot
+
+- Kappa/raw agreement được tính trên hai biểu độc lập trước adjudication và không tính lại như thể hai người đã đồng thuận từ đầu.
+- Adjudicator phải ghi lý do cho mọi quyết định.
+- Kết quả adjudication ban đầu là draft; đơn vị ghép hoặc lỗi nguồn phải được xử lý xong trước khi phê duyệt.
+- Bản `approved_pilot` chỉ xác nhận pilot và quy trình, không đồng nghĩa gold toàn corpus hoặc kết quả E1–E5.
+- Gợi ý máy/PhoBERT có thể hỗ trợ lô mở rộng sau khi pilot độc lập đã khóa, nhưng không tự trở thành gold.

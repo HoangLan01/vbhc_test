@@ -5,7 +5,10 @@ data/raw/
 data/processed/
 data/annotations/
 data/splits/
+data/external/
+models/
 results/
 evidence/
+paper/
 *.log
 .env

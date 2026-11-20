@@ -28,6 +28,32 @@ python scripts/workflow.py audit
 
 `audit` tạo chứng cứ môi trường và checksum ở `evidence/`, **không phải kết quả nghiên cứu**.
 
+### Bộ dữ liệu ngoài
+
+OTA và PAP_NER được quản lý riêng dưới `data/external/`, không trộn vào corpus mục tiêu hoặc gold/test E1–E5. Tải bản đã pin revision và kiểm tra hash bằng:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\external_datasets.py fetch --dataset all --extract-ota
+```
+
+OTA được dùng cho chuyển giao/đối chứng trích xuất quan hệ đơn vị–nhiệm vụ; PAP_NER được dùng để tiền huấn luyện token classification cho E3. Xem phạm vi, giấy phép và giới hạn tại `docs/EXTERNAL_DATASETS.md`.
+
+Sau khi tải, chuẩn hóa thành JSONL huấn luyện ngoài bằng:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\external_datasets.py prepare --dataset all
+```
+
+Các file chuẩn hóa vẫn mang cờ external/non-gold và không được ghép vào test của corpus mục tiêu.
+
+Smoke test fine-tune PhoBERT/PAP_NER trên CPU:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\train_pap_ner.py --smoke
+```
+
+Full fine-tune cần GPU CUDA; script từ chối chạy full trên CPU nếu không có `--allow-cpu-full`. Metric PAP_NER là external benchmark, không phải kết quả E1–E5 nội bộ.
+
 ## 1. Dataset thực tế – mục review 1
 
 1. Chỉ sao chép văn bản được phép sử dụng vào `data/raw/` (hỗ trợ DOCX/PDF/TXT/PNG/JPG).
@@ -42,6 +68,218 @@ python scripts/workflow.py ingest
 5. Kiểm tra thủ công đoạn nguồn; OCR không bảo đảm đúng số, ngày, tên cơ quan, dấu tiếng Việt. `candidate_segments.csv` chỉ là đơn vị đoạn để gán thử; cần tách/ghép lại nếu một đoạn chứa nhiều nhiệm vụ, và giữ định danh ổn định.
 
 **Điều kiện nghiệm thu:** bảng thống kê số văn bản, số đoạn, nguồn hợp lệ, cơ cấu loại văn bản, phân bố văn bản theo năm, tỷ lệ trang cần OCR, mẫu âm tính (không có nhiệm vụ cấp xã). Không ghi “300–500 văn bản đã thu thập” khi chưa có thật.
+
+### 1.1. Bổ sung văn bản theo cơ chế incremental
+
+Sau lần ingest đầu tiên, sao chép tài liệu mới vào `data/raw/` rồi chạy trên Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\workflow.py ingest --incremental
+```
+
+Nếu tài liệu mới là ảnh hoặc có trang scan cần OCR:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\workflow.py ingest --incremental --ocr
+```
+
+Cơ chế này:
+
+- đối chiếu SHA-256 nên nhận ra tài liệu đã nhập kể cả khi file bị đổi tên;
+- chỉ nối thêm tài liệu và đoạn mới, giữ nguyên metadata, `document_id`, `segment_id` và `source_location` cũ;
+- cảnh báo rồi bỏ qua nếu một đường dẫn cũ có nội dung/hash mới;
+- không cho kết hợp `--incremental` với `--force`;
+- nếu `segments_gold.csv` đã có hàng nhãn, chỉ nối các đoạn mới với cột nhãn trống; nếu file gold còn rỗng thì giữ nguyên file rỗng;
+- ghi nhật ký từng lần chạy tại `evidence/ingest_incremental_*.json`;
+- có thể chạy lặp lại: tài liệu đã có sẽ bị bỏ qua và không tạo hàng trùng.
+
+Sau mỗi lần bổ sung, kiểm tra manifest và điền metadata cho tài liệu mới. Không dùng incremental để thay thế hoặc cập nhật một văn bản cũ đã thay đổi nội dung; trường hợp đó cần được xem như phiên bản mới và xử lý có chủ đích.
+
+### 1.2. Báo cáo QC và chọn lô gán nhãn thử
+
+Trên Windows PowerShell, chạy báo cáo dẫn xuất không sửa manifest, đoạn ứng viên hoặc tài liệu gốc:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\workflow.py quality-report
+```
+
+Đầu ra nằm trong `results/quality/`: thống kê tổng hợp, thống kê theo tài liệu và trạng thái từng trang PDF. Báo cáo chỉ chứa số đếm/vị trí, không chép toàn văn đoạn nguồn. Lệnh không ghi đè đầu ra đã tồn tại nếu không có `--force`.
+
+Chọn pilot mặc định 80 đoạn, seed 42, tối thiểu 3 đoạn từ mỗi văn bản:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\workflow.py sample-pilot --n 80 --seed 42 --min-per-document 3
+```
+
+- `data/annotations/pilot_segments.csv`: file kiểm toán cách chọn mẫu, có tín hiệu heuristic nhưng **không phải nhãn gold**.
+- `data/annotations/segments_annotatorA.csv` và `segments_annotatorB.csv`: cùng danh sách `segment_id`, mọi cột nhãn để trống và không chứa tín hiệu heuristic.
+- `results/quality/pilot_selection_summary.csv`: phân bố lô pilot.
+
+Không dùng file master để gán nhãn vì có thể làm người gán bị ảnh hưởng bởi tín hiệu chọn mẫu. Hai người gán dùng riêng biểu A/B và không xem nhãn của nhau.
+
+Nếu cần gợi ý máy để rà soát **sau khi** người gán đã làm độc lập, chạy:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\workflow.py suggest-pilot-labels
+```
+
+Lệnh tạo `data/annotations/segments_ai_suggestions.csv` bằng luật/từ khóa cục bộ, không gửi dữ liệu ra ngoài và không sửa biểu A/B. Mọi hàng đều mang trạng thái `NON_GOLD_AI_SUGGESTION` và `human_review_required=1`. Không dùng file này để tính Kappa, huấn luyện như gold hoặc báo cáo chỉ số nghiên cứu khi chưa có người xác nhận.
+
+### 1.3. Giao diện gán nhãn cục bộ trên Windows
+
+Người A chạy:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\annotate_segments.py `
+  --input data/annotations/segments_annotatorA.csv `
+  --annotator-id A01
+```
+
+Người B chạy riêng:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\annotate_segments.py `
+  --input data/annotations/segments_annotatorB.csv `
+  --annotator-id B01
+```
+
+Ứng dụng hiển thị đoạn trước, đoạn đang gán và đoạn sau trong cùng văn bản; không đọc hoặc hiển thị file gợi ý máy. Phím tắt chi tiết: `F1` task=0, `F2` task=1, `F3` commune=0, `F4` commune=1, `PageUp` quay lại, `PageDown` lưu và sang đoạn tiếp theo, `Ctrl+S` lưu. Ba phím một-chạm giúp giảm thao tác nhưng không dùng AI: `F5` = không có nhiệm vụ, `F6` = có nhiệm vụ nhưng không thuộc cấp xã, `F7` = có nhiệm vụ thuộc cấp xã; cả ba đều lưu và chuyển sang hàng kế tiếp. Khi `task_present=0`, ứng dụng tự đặt `commune_relevance=0`.
+
+Mỗi phiên tạo bản sao tại `evidence/annotation_backups/`, khóa file để tránh hai tiến trình sửa cùng lúc và chỉ lưu `label_status=draft`. Nhật ký append-only ở `evidence/annotation_audit/` chỉ giữ ID, nhãn, hash và thời gian; không chép toàn văn hoặc nội dung ghi chú. Kiểm tra file và tiến độ mà không mở giao diện:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\annotate_segments.py `
+  --input data/annotations/segments_annotatorA.csv `
+  --annotator-id A01 `
+  --check
+```
+
+### 1.4. Adjudication pilot sau QC
+
+Sau khi cả A/B hoàn thành và `qc-labels` đã tạo danh sách bất đồng, kiểm tra hàng đợi bắt buộc mà chưa ghi file:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\adjudicate_pilot.py --check --mode mandatory
+```
+
+Mở giao diện adjudication:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\adjudicate_pilot.py `
+  --mode mandatory `
+  --adjudicator-id ADJ01
+```
+
+Tool hiển thị nhãn/ghi chú A và B, ngữ cảnh ±3 segment và toàn văn cùng `document_id`; segment hiện tại được làm nổi bật. `F5/F6/F7` chốt đơn vị hợp lệ lần lượt thành `0/0`, `1/0`, `1/1`; `F8` đánh dấu cần ghép và yêu cầu liệt kê `member_segment_ids` cùng tài liệu. Các trạng thái khác gồm `needs_source_check`, `ocr_error`, `exclude_invalid_unit`.
+
+Lần mở đầu tiên tạo `data/annotations/pilot_adjudication.csv` và manifest khóa SHA-256 của A/B, context và conflicts. Mỗi phiên có backup/audit. Kết quả vẫn là `PILOT_ADJUDICATION_NOT_GOLD`; tool không sửa `segments_gold.csv`.
+
+### 1.5. Tạo đơn vị pilot dẫn xuất sau adjudication
+
+Giữ nguyên mọi `segment_id` gốc và tạo annotation unit/mapping riêng:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_pilot_units.py prepare
+.\.venv\Scripts\python.exe scripts\build_pilot_units.py check
+```
+
+Đầu ra:
+
+- `data/annotations/pilot_annotation_units.csv`: text đơn vị dẫn xuất và nhãn draft;
+- `data/annotations/pilot_unit_mapping.csv`: ánh xạ unit về từng `segment_id` gốc;
+- `data/annotations/pilot_units_manifest.json`: hash nguồn và thông tin provenance.
+
+Đơn vị `needs_merge` được ghép theo đúng thứ tự `member_segment_ids` nhưng để nhãn trống. Sau khi người adjudicator đọc text ghép và đối chiếu nguồn, chốt nhãn bằng:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_pilot_units.py label `
+  --unit-id PILOT_MERGE_... `
+  --task-present 1 `
+  --commune-relevance 1 `
+  --adjudicator-id ADJ01 `
+  --rationale "Lý do chốt nhãn sau khi xem đơn vị ghép"
+```
+
+Lệnh tạo backup và audit, chỉ sửa file units dẫn xuất; kết quả vẫn chưa phải gold cho đến bước nghiệm thu riêng.
+
+### 1.6. Khóa pilot v1
+
+Khi mọi unit đã có nhãn và không còn pending, tạo bản approved riêng cùng snapshot SHA-256:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\freeze_pilot.py `
+  --approval-id pilot_v1 `
+  --approved-by ADJ01
+```
+
+Lệnh không sửa A/B, adjudication, mapping hoặc `segments_gold.csv`; không ghi đè bản approved/snapshot đã tồn tại. `approved_pilot` chỉ xác nhận pilot và quy trình, không phải gold toàn corpus. Xem `docs/PILOT_V1_REPORT.md` và `docs/GOLD_EXPANSION_PLAN.md`.
+
+### 1.7. Proposal mở rộng gold và review metadata
+
+Tạo unit proposals toàn corpus, mapping, readiness và gợi ý family mà không sửa nguồn:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\prepare_gold_expansion.py
+```
+
+Sau khi manifest metadata thay đổi, refresh có backup output cũ:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\prepare_gold_expansion.py --refresh
+```
+
+Các unit mới luôn mang trạng thái non-gold. Block ngắn chỉ được gắn cờ `needs_segmentation_review`, không tự ghép. Family pairs là gợi ý heuristic phải do người duyệt xác nhận.
+
+Tạo biểu metadata 79 văn bản có sẵn các giá trị hiện tại, ngày đã xác minh và gợi ý family:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\review_manifest_metadata.py prepare
+.\.venv\Scripts\python.exe scripts\review_manifest_metadata.py check
+```
+
+Mở giao diện nhập/review metadata:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\review_manifest_metadata.py gui
+```
+
+Có thể điền trước các trường lặp lại và family/source ổn định vào trạng thái `needs_review`:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\review_manifest_metadata.py autofill
+```
+
+`autofill` tạo backup, không tự approve và không áp dụng vào manifest. Ngày không có chứng cứ xác minh vẫn để trống.
+
+GUI có `Approve & Next`, nhảy tới hàng chưa approved và nút sao chép `permission_basis`/`access_level`/`anonymized`/`reviewer_id` từ hàng vừa lưu. Nó không tự sao chép `family_id`, nguồn hoặc ngày vì các trường này phải xác nhận theo từng tài liệu.
+
+Điền `family_id`, `doc_date`, `source_url_or_archive`, `permission_basis`, `access_level`, `anonymized`, `reviewer_id`; chỉ đặt `review_status=approved` sau khi kiểm tra đủ căn cứ. Áp dụng các hàng approved bằng:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\review_manifest_metadata.py apply
+```
+
+Lệnh apply bảo vệ `document_id`/filename/SHA-256, backup manifest và chỉ cập nhật các trường metadata được phép.
+
+### 1.8. Batch gold mở rộng 01 trên annotation units
+
+Sau khi metadata và G0 đạt quality gate, chọn batch 240 unit có seed cố định:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\sample_gold_units.py
+```
+
+Đầu ra gồm master có đặc trưng audit, hai biểu A/B nhãn trống, summary và batch manifest. Master/heuristic không được đưa cho người gán.
+
+Người A:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\annotate_units.py `
+  --input data/annotations/gold_batch_01_annotatorA.csv `
+  --annotator-id A02
+```
+
+Người B dùng file `gold_batch_01_annotatorB.csv` và mã `B02`. GUI hiển thị unit hiện tại, ±3 unit và toàn văn cùng tài liệu; `F5/F6/F7` lần lượt là `0/0`, `1/0`, `1/1`. Không hiển thị master, heuristic hoặc suggestion.
 
 ## 2. Nhãn độc lập – mục review 2
 
@@ -85,6 +323,32 @@ python scripts/workflow.py evaluate-routing --method rule --split dev
 ```
 
 `rule` chỉ là baseline heuristic, không phải quy tắc pháp lý được bảo đảm. Không được suy ra phòng chủ trì chỉ vì thấy một từ khóa.
+
+### Review phân luồng có truy vết
+
+Sau khi có prediction E4 và `config/units.json` đã được xác nhận, tạo một file review mới mà không sửa prediction hoặc `tasks_gold.csv`:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\review_routing.py prepare `
+  --predictions results/predictions/routing_hybrid_dev.csv `
+  --tasks data/annotations/tasks_gold.csv `
+  --units config/units.json `
+  --output data/annotations/routing_review_hybrid_dev.csv
+```
+
+Ghi một quyết định của người duyệt:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\review_routing.py record `
+  --review data/annotations/routing_review_hybrid_dev.csv `
+  --units config/units.json `
+  --task-id TASK_ID `
+  --decision accept `
+  --reviewer-id R01 `
+  --evidence-unit "Căn cứ chức năng/thẩm quyền đã kiểm tra"
+```
+
+Các quyết định hỗ trợ: `accept`, `reroute`, `abstain`, `needs_review`, `out_of_scope`. File review luôn mang trạng thái draft/non-gold; chỉ quy trình adjudication riêng mới được phép cập nhật `gold_unit`. Audit chỉ lưu ID/trạng thái/hash, không chép nội dung nhiệm vụ hoặc căn cứ chi tiết.
 
 **Embedding:** cài thêm theo `requirements-ml.txt`, cần Internet **trên máy bạn** khi tải mô hình lần đầu (bộ kit không kèm trọng số):
 
